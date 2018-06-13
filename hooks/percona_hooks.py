@@ -111,6 +111,8 @@ from percona_utils import (
     cluster_wait,
     get_wsrep_provider_options,
     get_server_id,
+    is_sufficient_peers,
+    set_ready_on_peers,
 )
 
 from charmhelpers.core.unitdata import kv
@@ -379,9 +381,9 @@ def config_changed():
             DEBUG)
         render_config_restart_on_changed(hosts,
                                          bootstrap=not leader_bootstrapped)
-    elif leader_bootstrapped:
+    elif leader_bootstrapped and is_sufficient_peers():
         # Speed up cluster process by bootstrapping when the leader has
-        # bootstrapped
+        # bootstrapped if we have expected number of peers
         if leader_ip not in hosts:
             # Fix Bug #1738896
             hosts = [leader_ip] + hosts
@@ -421,6 +423,7 @@ def config_changed():
     # bootstrapped
     if is_bootstrapped():
         update_root_password()
+        set_ready_on_peers()
 
 
 @hooks.hook('cluster-relation-joined')
@@ -451,7 +454,7 @@ def cluster_changed():
     inc_list = []
     for attr in rdata.iterkeys():
         if attr not in ['hostname', 'private-address', 'cluster-address',
-                        'public-address']:
+                        'public-address', 'ready']:
             inc_list.append(attr)
 
     peer_echo(includes=inc_list)

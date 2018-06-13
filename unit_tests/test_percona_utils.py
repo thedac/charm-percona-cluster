@@ -358,6 +358,25 @@ class UtilsTests(CharmTestCase):
         with self.assertRaises(ValueError):
             percona_utils.get_wsrep_provider_options()
 
+    def test_set_ready_on_peers(self):
+        self.relation_ids.return_value = ["rel:1"]
+        percona_utils.set_ready_on_peers()
+        self.relation_set.assert_called_with(relation_id="rel:1", ready=True)
+
+    def test_get_min_cluster_size(self):
+        _config = {}
+        self.config.side_effect = lambda key: _config.get(key)
+        self.relation_ids.return_value = ["rel:1"]
+        self.related_units.return_value = []
+        self.assertEqual(percona_utils.get_min_cluster_size(), 1)
+
+        self.related_units.return_value = ['unit/2', 'unit/9', 'unit/21']
+        self.assertEqual(percona_utils.get_min_cluster_size(), 4)
+
+        _config = {'min-cluster-size': 3}
+        self.config.side_effect = lambda key: _config.get(key)
+        self.assertEqual(percona_utils.get_min_cluster_size(), 3)
+
 
 class UtilsTestsStatus(CharmTestCase):
 
@@ -374,12 +393,15 @@ class UtilsTestsStatus(CharmTestCase):
         'is_unit_paused_set',
         'is_clustered',
         'distributed_wait',
+        'cluster_ready',
     ]
 
     def setUp(self):
         super(UtilsTestsStatus, self).setUp(percona_utils, self.TO_PATCH)
 
-    def test_single_unit(self):
+    @mock.patch.object(percona_utils, 'seeded')
+    def test_single_unit(self, mock_seeded):
+        mock_seeded.return_value = True
         self.config.return_value = None
         self.is_sufficient_peers.return_value = True
         stat, _ = percona_utils.charm_check_func()
@@ -549,13 +571,35 @@ class UtilsTestsCTC(CharmTestCase):
             # ports=None whilst port checks are disabled.
             f.assert_called_once_with('assessor', services='s1', ports=None)
 
+    @mock.patch.object(percona_utils, 'get_min_cluster_size')
+    @mock.patch.object(percona_utils, 'seeded')
     @mock.patch.object(percona_utils, 'is_sufficient_peers')
-    def test_is_bootstrapped(self, mock_is_sufficient_peers):
+    def test_is_bootstrapped(self, mock_is_sufficient_peers, mock_seeded,
+                             mock_get_min_cluster_size):
         kvstore = mock.MagicMock()
         kvstore.get.return_value = False
         self.kv.return_value = kvstore
 
+        mock_get_min_cluster_size.return_value = 1
+        # Single unit not yet seeded
+        self.relation_ids.return_value = []
+        mock_is_sufficient_peers.return_value = True
+        mock_seeded.return_value = False
+        self.assertFalse(percona_utils.is_bootstrapped())
+        kvstore.set.assert_not_called()
+
+        # Single unit seeded
+        self.relation_ids.return_value = []
+        mock_is_sufficient_peers.return_value = True
+        mock_seeded.return_value = True
+        self.assertTrue(percona_utils.is_bootstrapped())
+        kvstore.set.assert_called_once_with(key='initial-cluster-complete',
+                                            value=True)
+
         # Not sufficient number of peers
+        kvstore.reset_mock()
+        mock_get_min_cluster_size.return_value = 3
+        self.relation_ids.return_value = ['cluster:0']
         mock_is_sufficient_peers.return_value = False
         self.assertFalse(percona_utils.is_bootstrapped())
 
@@ -605,26 +649,43 @@ class UtilsTestsCTC(CharmTestCase):
         self.config.side_effect = lambda key: _config.get(key)
         self.assertTrue(percona_utils.is_bootstrapped())
 
-        # Assume single unit no-min-cluster-size
-        mock_is_sufficient_peers.return_value = True
-        self.relation_ids.return_value = []
-        self.related_units.return_value = []
-        self.relation_get.return_value = None
-        _config = {'min-cluster-size': None}
+    @mock.patch.object(percona_utils, 'seeded')
+    def test_cluster_ready(self, mock_seeded):
+        # Single unit not seeded
+        _config = {}
+        mock_seeded.return_value = False
         self.config.side_effect = lambda key: _config.get(key)
-        self.assertTrue(percona_utils.is_bootstrapped())
+        self.relation_ids.return_value = ['rel:1']
+        self.related_units.return_value = []
+        self.assertFalse(percona_utils.cluster_ready())
 
-    @mock.patch.object(percona_utils, 'is_bootstrapped')
-    def test_cluster_ready(self, mock_is_bootstrapped):
+        # Single unit seeded
+        _config = {}
+        mock_seeded.return_value = True
+        self.config.side_effect = lambda key: _config.get(key)
+        self.relation_ids.return_value = ['rel:1']
+        self.related_units.return_value = []
+        self.assertTrue(percona_utils.cluster_ready())
+
         # When VIP configured check is_clustered
-        mock_is_bootstrapped.return_value = True
         _config = {'vip': '10.10.10.10', 'min-cluster-size': 3}
         self.config.side_effect = lambda key: _config.get(key)
         # HACluster not ready
         self.is_clustered.return_value = False
         self.assertFalse(percona_utils.cluster_ready())
-        # HACluster ready
+
+        # HACluster ready peers not ready
         self.is_clustered.return_value = True
+        self.related_units.return_value = ['unit/1', 'unit/2']
+        self.relation_get.return_value = None
+        self.assertFalse(percona_utils.cluster_ready())
+
+        # HACluster ready one peer ready one not
+        self.relation_get.side_effect = [True, True, None]
+        self.assertFalse(percona_utils.cluster_ready())
+
+        # HACluster ready one all peers ready
+        self.relation_get.side_effect = [True, True, True]
         self.assertTrue(percona_utils.cluster_ready())
 
     @mock.patch.object(percona_utils, 'cluster_ready')

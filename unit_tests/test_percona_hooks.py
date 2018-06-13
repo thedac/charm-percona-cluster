@@ -41,6 +41,7 @@ TO_PATCH = ['log', 'config',
             'leader_get',
             'relation_clear',
             'is_relation_made',
+            'is_sufficient_peers',
             'peer_retrieve_by_prefix',
             'client_node_is_ready',
             'relation_set',
@@ -294,6 +295,7 @@ class TestConfigChanged(CharmTestCase):
         'is_bootstrapped',
         'clustered_once',
         'is_leader',
+        'is_sufficient_peers',
         'render_config_restart_on_changed',
         'update_client_db_relations',
         'install_mysql_ocf',
@@ -307,6 +309,7 @@ class TestConfigChanged(CharmTestCase):
         'install_percona_xtradb_cluster',
         'get_cluster_hosts',
         'leader_get',
+        'set_ready_on_peers',
     ]
 
     def setUp(self):
@@ -399,12 +402,26 @@ class TestConfigChanged(CharmTestCase):
         self.render_config_restart_on_changed.assert_not_called()
         self.update_bootstrap_uuid.assert_not_called()
 
-        # Leader is bootstrapped, no peers
+        # Leader is bootstrapped, insufficient peers
+        # Do not render
+        self.is_sufficient_peers.return_value = False
+        self.is_leader_bootstrapped.return_value = True
+        self.render_config_restart_on_changed.reset_mock()
+        self.install_percona_xtradb_cluster.reset_mock()
+
+        hooks.config_changed()
+        self.install_percona_xtradb_cluster.assert_called_once_with()
+        self.render_config_restart_on_changed.assert_not_called()
+        self.update_bootstrap_uuid.assert_not_called()
+
+        # Leader is bootstrapped, sufficient peers
         # Use the leader node and render.
+        self.is_sufficient_peers.return_value = True
         self.is_leader_bootstrapped.return_value = True
         self.get_cluster_hosts.return_value = []
-
         self.render_config_restart_on_changed.reset_mock()
+        self.install_percona_xtradb_cluster.reset_mock()
+
         hooks.config_changed()
         self.render_config_restart_on_changed.assert_called_once_with(
             ['10.10.10.10'])
@@ -436,6 +453,7 @@ class TestConfigChanged(CharmTestCase):
         # In none of the prior scenarios should update_root_password have been
         # called. is_bootstrapped was defaulted to False
         self.update_root_password.assert_not_called()
+        self.set_ready_on_peers.assert_not_called()
 
         # Leader present, leader bootstrapped, cluster bootstrapped
         self.is_bootstrapped.return_value = True
@@ -449,6 +467,7 @@ class TestConfigChanged(CharmTestCase):
             ['10.10.10.20', '10.10.10.30', '10.10.10.10'])
         self.update_bootstrap_uuid.assert_called_once()
         self.update_root_password.assert_called_once()
+        self.set_ready_on_peers.called_once()
 
 
 class TestInstallPerconaXtraDB(CharmTestCase):

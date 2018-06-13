@@ -502,13 +502,7 @@ def is_bootstrapped():
 
     @returns boolean
     """
-    min_size = config('min-cluster-size')
-    if not min_size:
-        units = 1
-        for relation_id in relation_ids('cluster'):
-            units += len(related_units(relation_id))
-        min_size = units
-
+    min_size = get_min_cluster_size()
     if not is_sufficient_peers():
         return False
     elif min_size > 1:
@@ -541,6 +535,9 @@ def is_bootstrapped():
         else:
             log("All {} percona units reporting clustered".format(min_size),
                 DEBUG)
+    elif not seeded():
+        # Single unit deployment but not yet bootstrapped
+        return False
 
     # Set INITIAL_CLUSTERED_KEY as the cluster has fully bootstrapped
     kvstore = kv()
@@ -699,7 +696,10 @@ def charm_check_func():
         else:
             return ('waiting', 'Unit waiting on hacluster relation')
     else:
-        return ('active', 'Unit is ready')
+        if seeded():
+            return ('active', 'Unit is ready')
+        else:
+            return ('waiting', 'Unit waiting to bootstrap')
 
 
 @cached
@@ -866,6 +866,22 @@ def get_cluster_host_ip():
     return cluster_addr
 
 
+def get_min_cluster_size():
+    """ Get the minimum cluster size
+
+    If the config value is set use that, if not count the number of units on
+    the cluster relation.
+    """
+
+    min_cluster_size = config('min-cluster-size')
+    if not min_cluster_size:
+        units = 1
+        for relation_id in relation_ids('cluster'):
+            units += len(related_units(relation_id))
+        min_cluster_size = units
+    return min_cluster_size
+
+
 def cluster_ready():
     """Determine if each node in the cluster is ready to respond to client
     requests.
@@ -883,7 +899,25 @@ def cluster_ready():
             DEBUG)
         return False
 
-    return is_bootstrapped()
+    min_cluster_size = get_min_cluster_size()
+    # Single unit deployment return state of seeded
+    if int(min_cluster_size) == 1:
+        return seeded()
+
+    peers = {}
+    relation_id = relation_ids('cluster')[0]
+    units = related_units(relation_id) or []
+    if local_unit() not in units:
+        units.append(local_unit())
+    for unit in units:
+        peers[unit] = relation_get(attribute='ready',
+                                   rid=relation_id,
+                                   unit=unit)
+
+    if len(peers) >= min_cluster_size:
+        return all(peers.values())
+
+    return False
 
 
 def client_node_is_ready():
@@ -1052,3 +1086,12 @@ def get_server_id():
         server_id = MAX_SERVER_ID
 
     return server_id
+
+
+def set_ready_on_peers():
+    """ Set ready on peers
+
+    Notify peers this unit is clustered and ready to serve clients
+    """
+    for relid in relation_ids('cluster'):
+        relation_set(relation_id=relid, ready=True)
