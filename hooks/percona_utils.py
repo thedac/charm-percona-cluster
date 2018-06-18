@@ -905,14 +905,14 @@ def cluster_ready():
         return seeded()
 
     peers = {}
-    relation_id = relation_ids('cluster')[0]
-    units = related_units(relation_id) or []
-    if local_unit() not in units:
-        units.append(local_unit())
-    for unit in units:
-        peers[unit] = relation_get(attribute='ready',
-                                   rid=relation_id,
-                                   unit=unit)
+    for relation_id in relation_ids('cluster'):
+        units = related_units(relation_id) or []
+        if local_unit() not in units:
+            units.append(local_unit())
+        for unit in units:
+            peers[unit] = relation_get(attribute='ready',
+                                       rid=relation_id,
+                                       unit=unit)
 
     if len(peers) >= min_cluster_size:
         return all(peers.values())
