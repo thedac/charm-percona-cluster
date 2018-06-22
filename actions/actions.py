@@ -12,7 +12,6 @@ from charmhelpers.core.hookenv import (
     action_get,
     action_set,
     action_fail,
-    config,
 )
 
 from charmhelpers.core.host import (
@@ -24,6 +23,7 @@ from percona_utils import (
     pause_unit_helper,
     resume_unit_helper,
     register_configs,
+    _get_password,
 )
 from percona_hooks import config_changed
 
@@ -51,7 +51,7 @@ def backup(args):
     basedir = (action_get("basedir")).lower()
     compress = action_get("compress")
     incremental = action_get("incremental")
-    sstpw = config("sst-password")
+    sstpw = _get_password("sst-password")
     optionlist = []
 
     # innobackupex will not create recursive dirs that do not already exist,
