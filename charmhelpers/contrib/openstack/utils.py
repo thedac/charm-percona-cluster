@@ -837,6 +837,16 @@ def _ows_check_if_paused(services=None, ports=None):
     @param ports: OPTIONAL list of port numbers.
     @returns state, message or None, None
     """
+    if is_unit_upgrading_set():
+        state, message = check_actually_paused(services=services,
+                                               ports=ports)
+        if state is None:
+            # we're paused okay, so set maintenance and return
+            state = "blocked"
+            message = ("Ready for drain, do_release_upgrade, reboot. "
+                       "Set complete when finished")
+        return state, message
+
     if is_unit_paused_set():
         state, message = check_actually_paused(services=services,
                                                ports=ports)
@@ -845,6 +855,7 @@ def _ows_check_if_paused(services=None, ports=None):
             state = "maintenance"
             message = "Paused. Use 'resume' action to resume normal service."
         return state, message
+
     return None, None
 
 
@@ -1339,7 +1350,7 @@ def pause_unit(assess_status_func, services=None, ports=None,
         message = assess_status_func()
         if message:
             messages.append(message)
-    if messages:
+    if messages and not is_unit_upgrading_set():
         raise Exception("Couldn't pause: {}".format("; ".join(messages)))
 
 
@@ -1689,3 +1700,38 @@ def install_os_snaps(snaps, refresh=False):
             snap_install(snap,
                          _ensure_flag(snaps[snap]['channel']),
                          _ensure_flag(snaps[snap]['mode']))
+
+
+def set_unit_upgrading():
+    """Set the unit to a upgrading state in the local kv() store.
+    This does NOT actually pause the unit
+    """
+    with unitdata.HookData()() as t:
+        kv = t[0]
+        kv.set('unit-upgrading', True)
+
+
+def clear_unit_upgrading():
+    """Clear the unit from a upgrading state in the local kv() store
+    This does NOT actually restart any services - it only clears the
+    local state.
+    """
+    with unitdata.HookData()() as t:
+        kv = t[0]
+        kv.set('unit-upgrading', False)
+
+
+def is_unit_upgrading_set():
+    """Return the state of the kv().get('unit-upgrading').
+    This does NOT verify that the unit really is upgrading.
+
+    To help with units that don't have HookData() (testing)
+    if it excepts, return False
+    """
+    try:
+        with unitdata.HookData()() as t:
+            kv = t[0]
+            # transform something truth-y into a Boolean.
+            return not(not(kv.get('unit-upgrading')))
+    except Exception:
+        return False

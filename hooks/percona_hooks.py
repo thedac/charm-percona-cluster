@@ -69,6 +69,10 @@ from charmhelpers.contrib.hardening.harden import harden
 from charmhelpers.contrib.hardening.mysql.checks import run_mysql_checks
 from charmhelpers.contrib.openstack.utils import (
     is_unit_paused_set,
+    is_unit_upgrading_set,
+    set_unit_upgrading,
+    clear_unit_upgrading,
+    clear_unit_paused,
 )
 from charmhelpers.contrib.openstack.ha.utils import (
     update_dns_ha_resource_params,
@@ -113,6 +117,7 @@ from percona_utils import (
     get_server_id,
     is_sufficient_peers,
     set_ready_on_peers,
+    pause_unit_helper,
 )
 
 from charmhelpers.core.unitdata import kv
@@ -305,7 +310,13 @@ def update_client_db_relations():
             kvstore.flush()
 
 
-@hooks.hook('upgrade-charm')
+@hooks.hook('upgrade-charm', 'pre-series-upgrade')
+def prepare():
+    pause_unit_helper()
+    set_unit_upgrading()
+
+
+@hooks.hook('upgrade-charm', 'post-series-upgrade')
 @harden()
 def upgrade():
 
@@ -344,6 +355,8 @@ def upgrade():
             update_bootstrap_uuid()
         except LeaderNoBootstrapUUIDError:
             status_set('waiting', "Waiting for bootstrap-uuid set by leader")
+    clear_unit_paused()
+    clear_unit_upgrading()
 
 
 @hooks.hook('config-changed')
