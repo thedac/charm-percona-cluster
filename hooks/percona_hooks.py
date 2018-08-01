@@ -4,6 +4,7 @@ import sys
 import json
 import os
 import socket
+import subprocess
 
 from charmhelpers.core.hookenv import (
     Hooks, UnregisteredHookError,
@@ -32,8 +33,10 @@ from charmhelpers.core.host import (
     service_restart,
     service_running,
     service_stop,
+    service,
     file_hash,
     lsb_release,
+    mkdir,
     CompareHostReleases,
 )
 from charmhelpers.core.templating import render
@@ -69,6 +72,10 @@ from charmhelpers.contrib.hardening.harden import harden
 from charmhelpers.contrib.hardening.mysql.checks import run_mysql_checks
 from charmhelpers.contrib.openstack.utils import (
     is_unit_paused_set,
+    is_unit_upgrading_set,
+    set_unit_upgrading,
+    clear_unit_upgrading,
+    clear_unit_paused,
 )
 from charmhelpers.contrib.openstack.ha.utils import (
     update_dns_ha_resource_params,
@@ -113,6 +120,7 @@ from percona_utils import (
     get_server_id,
     is_sufficient_peers,
     set_ready_on_peers,
+    pause_unit_helper,
 )
 
 from charmhelpers.core.unitdata import kv
@@ -195,6 +203,7 @@ def render_config(hosts=None):
         'performance_schema': config('performance-schema'),
         'is_leader': is_leader(),
         'server_id': get_server_id(),
+        'series_upgrade': is_unit_upgrading_set(),
     }
 
     if config('prefer-ipv6'):
@@ -305,12 +314,101 @@ def update_client_db_relations():
             kvstore.flush()
 
 
+@hooks.hook('pre-series-upgrade')
+def prepare():
+    # Use the pause feature to stop mysql during the duration of the upgrade
+    pause_unit_helper(register_configs())
+    # Set this unit to series upgrading
+    set_unit_upgrading()
+    # The leader will "bootstrap" with no wrep peers
+    # Non-leaders will point only at the newly upgraded leader until the
+    # cluster series upgrade is completed.
+    # Set cluster_series_upgrading for the duration of the cluster series
+    # upgrade. This will be unset with the action
+    # complete-cluster-series-upgrade on the leader node.
+    if is_leader():
+        leader_set(cluster_series_upgrading=True)
+        hosts = []
+    else:
+        hosts = [leader_get('leader-ip')]
+
+    # Render config
+    render_config(hosts)
+
+
+@hooks.hook('post-series-upgrade')
+def series_upgrade():
+
+    # Set this unit to series upgrading
+    set_unit_upgrading()
+
+    # The leader will "bootstrap" with no wrep peers
+    # Non-leaders will point only at the newly upgraded leader until the
+    # cluster series upgrade is completed.
+    # Set cluster_series_upgrading for the duration of the cluster series
+    # upgrade. This will be unset with the action
+    # complete-cluster-series-upgrade on the leader node.
+    if is_leader():
+        leader_set(cluster_series_upgrading=True)
+        hosts = []
+    else:
+        hosts = [leader_get('leader-ip')]
+
+    # Guarantee /var/run/mysqld exists
+    _dir = '/var/run/mysqld'
+    mkdir(_dir, owner="mysql", group="mysql", perms=0o755)
+
+    # Install new versions of the percona packages
+    apt_install(determine_packages())
+    service_stop("mysql")
+
+    # XXX Only if this is trusty -> xenial
+    # Move the packaged version empty DB out of the way.
+    cmd = ["mv", "/var/lib/percona-xtradb-cluster",
+           "/var/lib/percona-xtradb-cluster.dpkg"]
+    subprocess.check_call(cmd)
+
+    # Symlink the previous versions data to the new
+    cmd = ["ln", "-s", "/var/lib/mysql", "/var/lib/percona-xtradb-cluster"]
+    subprocess.check_call(cmd)
+
+    # Start mysql temporarily with no wrep for the upgrade
+    cmd = ["mysqld", "--wsrep-provider='none'"]
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    # XXX remove time sleeps
+    import time
+    time.sleep(30)
+
+    # Execute the upgrade process
+    cmd = ['mysql_upgrade', '-p{}'.format(root_password())]
+    subprocess.check_call(cmd)
+
+    # Terminate the temporary mysql
+    proc.terminate()
+    time.sleep(30)
+
+    # Clear states
+    clear_unit_paused()
+    clear_unit_upgrading()
+
+    # Point at the correct my.cnf
+    cmd = ["update-alternatives", "--set", "my.cnf",
+           "/etc/mysql/percona-xtradb-cluster.cnf"]
+    subprocess.check_call(cmd)
+
+    # Render config
+    render_config(hosts)
+
+    # Start up mysql normally
+    service('start', 'mysql')
+
+
 @hooks.hook('upgrade-charm')
 @harden()
 def upgrade():
 
     if is_leader():
-        if is_unit_paused_set():
+        if is_unit_paused_set() or is_unit_upgrading_set():
             log('Unit is paused, skiping upgrade', level=INFO)
             return
 
@@ -350,16 +448,17 @@ def upgrade():
 @harden()
 def config_changed():
 
+    # if we are paused or upgrading, delay doing any config changed hooks.
+    # It is forced on the resume.
+    if is_unit_paused_set() or is_unit_upgrading_set():
+        log("Unit is pause or upgrading. Skipping config_changed", "WARN")
+        return
+
     # It is critical that the installation is attempted first before any
     # rendering of the configuration files occurs.
     # install_percona_xtradb_cluster has the code to decide if this is the
     # leader or if the leader is bootstrapped and therefore ready for install.
     install_percona_xtradb_cluster()
-
-    # if we are paused, delay doing any config changed hooks.  It is forced on
-    # the resume.
-    if is_unit_paused_set():
-        return
 
     if config('prefer-ipv6'):
         assert_charm_supports_ipv6()
@@ -367,6 +466,7 @@ def config_changed():
     hosts = get_cluster_hosts()
     leader_bootstrapped = is_leader_bootstrapped()
     leader_ip = leader_get('leader-ip')
+    cluster_series_upgrading = leader_get("cluster_series_upgrading")
 
     if is_leader():
         # If the cluster has not been fully bootstrapped once yet, use an empty
@@ -375,13 +475,17 @@ def config_changed():
         # After, the cluster has bootstrapped at least one time, it is much
         # less likely to have restart collisions. It is then safe to use the
         # full hosts list and have the leader node's mysqld restart.
-        if not clustered_once():
+        # Empty hosts if cluster_series_upgrading
+        if not clustered_once() or cluster_series_upgrading:
             hosts = []
         log("Leader unit - bootstrap required=%s" % (not leader_bootstrapped),
             DEBUG)
         render_config_restart_on_changed(hosts,
                                          bootstrap=not leader_bootstrapped)
-    elif leader_bootstrapped and is_sufficient_peers():
+    elif (leader_bootstrapped and
+          is_sufficient_peers() and not
+          cluster_series_upgrading):
+        # Skip if cluster_series_upgrading
         # Speed up cluster process by bootstrapping when the leader has
         # bootstrapped if we have expected number of peers
         if leader_ip not in hosts:
@@ -835,6 +939,12 @@ def update_nrpe_config():
 @harden()
 def update_status():
     log('Updating status.')
+    # XXX: Potentially temporary while the series upgrade feature is
+    # developled in juju.
+    # The feature should stop all hooks from executing
+    # In the meantime make sure we do not run update-status while upgrading.
+    if is_unit_upgrading_set():
+        exit()
 
 
 def main():
